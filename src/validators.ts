@@ -1,0 +1,726 @@
+// Credential self-validation (pivot spec §4 step 5 / answers Q4).
+//
+// Each validator makes a REAL authenticated call to the provider and returns a
+// specific, actionable {ok, detail}. The agency iterates on `/validate` in their
+// own Cloudflare dashboard until every result is green — no round-trips back to
+// us to debug. A credential that isn't configured yet returns a clear
+// "not configured" result (ok:false) rather than throwing.
+//
+// Worker-native only: fetch + Web Crypto (crypto.subtle). No AWS/GCP SDKs.
+
+import type { Env } from "./env.js";
+import { signS3Request } from "./sigv4.js";
+import { errorMessage, extractXmlTag, stripTrailingSlash } from "./util.js";
+
+export interface ValidationResult {
+  ok: boolean;
+  detail: string;
+}
+
+export interface AllValidations {
+  gcp: ValidationResult;
+  s3: ValidationResult;
+  stripe: ValidationResult;
+  ai: ValidationResult;
+  r2Provision: ValidationResult;
+  cfDns: ValidationResult;
+}
+
+// ── S3 / object storage ────────────────────────────────────────────────────────
+
+// The object-store credential (S3_*), resolved and defaulted from Env once so the
+// two validation strategies below don't each re-derive it. `endpoint` is set only
+// for an S3-compatible store (Cloudflare R2 / MinIO / Wasabi); it is undefined for
+// real AWS S3.
+interface ObjectStoreCredential {
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  region: string;
+  endpoint?: string;
+}
+
+// The write probe uploads a tiny object under a UNIQUE key each run. Unique because a
+// WORM / Object-Lock bucket blocks OVERWRITE of an existing key — reusing a fixed key
+// would false-RED a locked bucket on the second validation; a fresh key is always a NEW
+// object (which WORM permits), so re-validation stays reliable. It is best-effort deleted
+// after (a locked bucket refuses the delete by design; the tiny marker is then retained —
+// harmless). A PUT (not a GET) is used deliberately: the store's only job is receiving
+// backup PUTs, so a read probe could go green on a key that can't actually write.
+const OBJECT_STORE_PROBE_KEY_PREFIX = ".doubleyoup-connectivity-probe";
+const OBJECT_STORE_PROBE_BODY = "doubleyoup object-store connectivity + write probe";
+
+function objectStoreProbeKey(): string {
+  return `${OBJECT_STORE_PROBE_KEY_PREFIX}-${crypto.randomUUID()}`;
+}
+
+// Prove the object-store credential can authenticate AND actually WRITE to the bucket by
+// uploading (then best-effort deleting) a tiny probe object. WRITE — not read — because the
+// store's sole job is receiving backup PUTs: a read/list probe can pass on a key that then
+// can't write (a read-only token, or a bucket whose lock/policy blocks writes), i.e. a green
+// check that doesn't prove the thing that matters (review finding #3).
+//
+// URL style differs by whether a custom S3_ENDPOINT is set:
+//   • custom endpoint (recommended Cloudflare R2 path, also MinIO / Wasabi) — path-style
+//     <endpoint>/<bucket>/<key>.
+//   • real AWS S3 (no endpoint) — virtual-hosted-style <bucket>.s3.<region>.amazonaws.com/<key>.
+// Both go through the same write probe (probeObjectStoreWithWrite), which fails CLOSED on any
+// response that isn't a genuine S3 one, so a mis-typed / non-S3 S3_ENDPOINT can't false-green
+// (review finding #1).
+export async function validateS3(env: Env): Promise<ValidationResult> {
+  if (!env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY || !env.S3_BUCKET) {
+    return {
+      ok: false,
+      detail:
+        "S3 not configured — set the S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY and S3_BUCKET secrets.",
+    };
+  }
+
+  const credential: ObjectStoreCredential = {
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    bucket: env.S3_BUCKET,
+    region: env.S3_REGION || "us-east-1",
+    endpoint: env.S3_ENDPOINT ? stripTrailingSlash(env.S3_ENDPOINT) : undefined,
+  };
+
+  const bucketUrl = credential.endpoint
+    ? `${credential.endpoint}/${encodeURIComponent(credential.bucket)}`
+    : `https://${credential.bucket}.s3.${credential.region}.amazonaws.com`;
+  const where = credential.endpoint ?? `s3.${credential.region}.amazonaws.com`;
+  return probeObjectStoreWithWrite(credential, bucketUrl, where);
+}
+
+// Both object-store paths (custom-endpoint R2/MinIO/Wasabi and real AWS S3) run this ONE
+// write probe: PUT a tiny unique object, judge the response, then best-effort delete it.
+// It fails CLOSED on anything that isn't a genuine S3 response so a mis-typed or non-S3
+// S3_ENDPOINT cannot false-green (#1), and it proves WRITE, not just read (#3).
+//
+// Response precedence (deliberate + unambiguous):
+//   3xx / opaque redirect ... endpoint redirected (not a direct S3 API) -> fail (redirect:"manual")
+//   2xx WITH an ETag ........ genuine S3 PutObject succeeded -> writable -> ok
+//   2xx WITHOUT an ETag ..... not an S3 object store (proxy/SPA/health page) -> fail (#1)
+//   InvalidAccessKeyId ...... bad access key id -> fail
+//   SignatureDoesNotMatch ... bad secret / region -> fail
+//   NoSuchBucket ............ wrong bucket or endpoint -> fail
+//   403 / AccessDenied ...... authenticated but not authorized to WRITE -> fail (#3)
+//   4xx/5xx with NO S3 <Code> non-S3 endpoint -> fail (#1)
+//   any other S3 <Code> ..... generic failure with the HTTP status + code
+async function probeObjectStoreWithWrite(
+  cred: ObjectStoreCredential,
+  bucketUrl: string,
+  where: string,
+): Promise<ValidationResult> {
+  const probeUrl = `${bucketUrl}/${objectStoreProbeKey()}`;
+
+  let response: Response;
+  try {
+    const signed = await signS3Request({
+      method: "PUT",
+      url: probeUrl,
+      region: cred.region,
+      accessKeyId: cred.accessKeyId,
+      secretAccessKey: cred.secretAccessKey,
+      body: OBJECT_STORE_PROBE_BODY,
+    });
+    // redirect:"manual" so a redirecting host surfaces as a 3xx we can reject, rather than
+    // silently following to some 200 landing page (which would false-green — #1).
+    response = await fetch(signed.url, {
+      method: "PUT",
+      headers: signed.headers,
+      body: OBJECT_STORE_PROBE_BODY,
+      redirect: "manual",
+    });
+  } catch (err) {
+    return { ok: false, detail: `Object store request could not be sent: ${errorMessage(err)}.` };
+  }
+
+  // A redirect means S3_ENDPOINT points at a redirecting/proxy host, not the S3 API itself.
+  // With redirect:"manual" a real 3xx keeps its status; a runtime that instead yields an
+  // opaque-redirect filtered response reports status 0 — treat both as a redirect failure.
+  if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
+    // On the custom-endpoint path a redirect means S3_ENDPOINT isn't the direct S3 API; on the
+    // AWS path a 301 PermanentRedirect means the bucket is in a different region (wrong S3_REGION),
+    // so point at the knob that actually applies.
+    const hint = cred.endpoint
+      ? "set S3_ENDPOINT to the direct S3/R2 API endpoint, not a redirecting or proxy host"
+      : "the bucket appears to be in a different region — set S3_REGION to the bucket's actual region";
+    return {
+      ok: false,
+      detail: `Object store endpoint ${where} redirected the request (HTTP ${response.status || "3xx"}) — ${hint}.`,
+    };
+  }
+
+  if (response.status >= 200 && response.status < 300) {
+    // A genuine S3 PutObject always returns an ETag of the stored object. Its ABSENCE means
+    // the 2xx came from something that is NOT an S3-compatible store (a proxy, SPA or health
+    // page answering 200 for any path), so we must NOT report success — that is the false
+    // green (#1). Drain the body either way so the connection frees.
+    const etag = response.headers.get("etag");
+    await response.text().catch(() => "");
+    if (!etag) {
+      return {
+        ok: false,
+        detail: `Object store endpoint ${where} returned HTTP ${response.status} but no S3 ETag — S3_ENDPOINT does not look like an S3-compatible object store. Check S3_ENDPOINT.`,
+      };
+    }
+    // Write proven. Best-effort remove the marker (a WORM/locked bucket refuses this — fine).
+    await bestEffortDeleteProbe(cred, probeUrl);
+    return {
+      ok: true,
+      detail: `Object store bucket "${cred.bucket}" at ${where} is writable (a probe object was uploaded with the credential).`,
+    };
+  }
+
+  // 4xx/5xx: a genuine S3 store returns an XML <Error><Code>. Map the known codes; the
+  // ABSENCE of any code is itself a signal the endpoint isn't S3-compatible (#1).
+  const body = (await response.text().catch(() => "")).slice(0, 500);
+  const code = extractXmlTag(body, "Code");
+
+  if (code === "InvalidAccessKeyId") {
+    return { ok: false, detail: "S3 access key not recognised (InvalidAccessKeyId) — check S3_ACCESS_KEY_ID." };
+  }
+  if (code === "SignatureDoesNotMatch") {
+    return {
+      ok: false,
+      detail:
+        'S3 signature mismatch (SignatureDoesNotMatch) — check S3_SECRET_ACCESS_KEY and S3_REGION (use "auto" for Cloudflare R2).',
+    };
+  }
+  if (code === "NoSuchBucket") {
+    return {
+      ok: false,
+      detail: `Object store bucket "${cred.bucket}" not found (NoSuchBucket) — check S3_BUCKET and S3_ENDPOINT.`,
+    };
+  }
+  if (response.status === 403 || code === "AccessDenied") {
+    return {
+      ok: false,
+      detail:
+        `Object store write denied (403) for bucket "${cred.bucket}" — the key authenticated but is not authorized to WRITE. ` +
+        "For Cloudflare R2, scope the API token to this bucket with Object Read & Write; for AWS the key needs s3:PutObject.",
+    };
+  }
+  if (!code) {
+    return {
+      ok: false,
+      detail: `Object store endpoint ${where} returned HTTP ${response.status} with no S3 error code — S3_ENDPOINT may not be an S3-compatible object store. Check S3_ENDPOINT.`,
+    };
+  }
+  // Surface R2/S3's own <Message> for any code we don't special-case above — it names the
+  // exact rejected argument (e.g. an unsupported header or a malformed value), which is what
+  // an operator actually needs to fix a generic 4xx like InvalidArgument.
+  const message = extractXmlTag(body, "Message");
+  return {
+    ok: false,
+    detail: `Object store write check failed with HTTP ${response.status} (${code})${
+      message ? `: ${message}` : ""
+    }.`,
+  };
+}
+
+// Best-effort cleanup of the probe object. NEVER affects the validation result: a WORM /
+// Object-Lock bucket refuses the delete (by design) and any network hiccup is irrelevant —
+// the write already succeeded, which is what we validated.
+async function bestEffortDeleteProbe(cred: ObjectStoreCredential, probeUrl: string): Promise<void> {
+  try {
+    const signed = await signS3Request({
+      method: "DELETE",
+      url: probeUrl,
+      region: cred.region,
+      accessKeyId: cred.accessKeyId,
+      secretAccessKey: cred.secretAccessKey,
+    });
+    const response = await fetch(signed.url, {
+      method: "DELETE",
+      headers: signed.headers,
+      redirect: "manual",
+    });
+    await response.text().catch(() => "");
+  } catch {
+    // cleanup only — ignore
+  }
+}
+
+// ── Stripe ──────────────────────────────────────────────────────────────────
+
+// GET /v1/account with the secret key as a bearer token. 200 => the key works.
+export async function validateStripe(env: Env): Promise<ValidationResult> {
+  if (!env.STRIPE_SECRET_KEY) {
+    return { ok: false, detail: "Stripe not configured — set the STRIPE_SECRET_KEY secret." };
+  }
+
+  try {
+    const response = await fetch("https://api.stripe.com/v1/account", {
+      headers: {
+        authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      const account = (await response.json()) as { id?: string };
+      // Stripe key prefixes encode the mode; report it so the agency can catch a
+      // test key pasted where a live key belongs (or vice-versa).
+      const isLive = env.STRIPE_SECRET_KEY.includes("_live_");
+      const accountId = account.id ?? "unknown";
+      return {
+        ok: true,
+        detail: `Stripe account ${accountId} authenticated (${isLive ? "live" : "test"} mode).`,
+      };
+    }
+    if (response.status === 401) {
+      return { ok: false, detail: "Stripe rejected the key (401 Unauthorized) — check STRIPE_SECRET_KEY." };
+    }
+
+    const body = (await response.json().catch(() => null)) as { error?: { message?: string } } | null;
+    const message = body?.error?.message;
+    return {
+      ok: false,
+      detail: `Stripe check failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
+    };
+  } catch (err) {
+    return { ok: false, detail: `Stripe request could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// ── R2 provisioning ─────────────────────────────────────────────────────────
+
+// GET /user/tokens/verify only validates USER-owned tokens (My Profile → API
+// Tokens) — it returns a 401 "Invalid API Token" even for a perfectly valid
+// ACCOUNT-owned token (Manage Account → Account API Tokens), which is what
+// this credential must be. So instead we hit a cheap account-scoped read
+// (GET /accounts?per_page=1) that authenticates against account tokens: a
+// 200 with a non-empty result proves the token is valid, though — like the
+// user-tokens endpoint — it can't enumerate the permission groups the token
+// was minted with, so a green result here does not guarantee the R2 Storage
+// / Account API Tokens edit scopes are actually present. Those scopes are
+// only exercised for real on the first site provision (bucket create +
+// scoped-key mint).
+export async function validateR2Provision(env: Env): Promise<ValidationResult> {
+  if (!env.R2_PROVISION_API_TOKEN) {
+    return {
+      ok: false,
+      detail: "R2 provisioning not configured — set the R2_PROVISION_API_TOKEN secret.",
+    };
+  }
+
+  try {
+    const response = await fetch("https://api.cloudflare.com/client/v4/accounts?per_page=1", {
+      headers: {
+        authorization: `Bearer ${env.R2_PROVISION_API_TOKEN}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      const body = (await response.json().catch(() => null)) as {
+        success?: boolean;
+        result?: Array<{ name?: string }>;
+      } | null;
+      if (body?.success && body.result && body.result.length > 0) {
+        const accountName = body.result[0]?.name;
+        return {
+          ok: true,
+          detail: `R2 provisioning token valid${accountName ? ` — account: ${accountName}` : ""}. Permissions are exercised on first site provision.`,
+        };
+      }
+      return {
+        ok: false,
+        detail: "R2 provisioning token check returned no accounts — check R2_PROVISION_API_TOKEN.",
+      };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        detail:
+          "Cloudflare rejected the token — check R2_PROVISION_API_TOKEN (must be an ACCOUNT-owned token: Manage Account → Account API Tokens).",
+      };
+    }
+
+    const body = (await response.json().catch(() => null)) as {
+      errors?: Array<{ message?: string }>;
+    } | null;
+    const message = body?.errors?.[0]?.message;
+    return {
+      ok: false,
+      detail: `R2 provisioning token check failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `R2 provisioning token check could not be sent (transient network error?): ${errorMessage(err)}.`,
+    };
+  }
+}
+
+// ── Cloudflare DNS (Direction-B dns-record-upsert + cache-purge) ─────────────
+
+// READ-ONLY probe: GET /zones?per_page=1 proves CF_DNS_API_TOKEN authenticates and can
+// list at least one zone (Zone:Read). Like validateR2Provision, Cloudflare can't tell us
+// which permission groups a token was minted with, so a green here proves Zone:Read on
+// >= 1 zone but NOT Zone:DNS:Edit or Zone:Cache Purge — those scopes are exercised for
+// real on the first dns-record-upsert / cache-purge dispatch, which reports a clear denial
+// if the scope is missing. We never write a record or purge a cache from a validator.
+export async function validateCfDns(env: Env): Promise<ValidationResult> {
+  if (!env.CF_DNS_API_TOKEN) {
+    return {
+      ok: false,
+      detail: "Cloudflare DNS not configured — set the CF_DNS_API_TOKEN secret (Zone:DNS:Edit + Zone:Read).",
+    };
+  }
+
+  try {
+    const response = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=1", {
+      headers: {
+        authorization: `Bearer ${env.CF_DNS_API_TOKEN}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      const body = (await response.json().catch(() => null)) as {
+        success?: boolean;
+        result?: Array<{ name?: string }>;
+      } | null;
+      if (body?.success && body.result && body.result.length > 0) {
+        const zoneName = body.result[0]?.name;
+        return {
+          ok: true,
+          detail: `Cloudflare DNS token valid${zoneName ? ` — can read zone ${zoneName}` : ""}. DNS edit permission is exercised on the first DNS dispatch.`,
+        };
+      }
+      return {
+        ok: false,
+        detail:
+          "Cloudflare DNS token authenticated but can list no zones — scope CF_DNS_API_TOKEN to the zone(s) the platform should manage (Zone:Read + Zone:DNS:Edit).",
+      };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        detail: "Cloudflare rejected the token — check CF_DNS_API_TOKEN (needs Zone:Read + Zone:DNS:Edit).",
+      };
+    }
+
+    const body = (await response.json().catch(() => null)) as {
+      errors?: Array<{ message?: string }>;
+    } | null;
+    const message = body?.errors?.[0]?.message;
+    return {
+      ok: false,
+      detail: `Cloudflare DNS token check failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `Cloudflare DNS token check could not be sent (transient network error?): ${errorMessage(err)}.`,
+    };
+  }
+}
+
+// ── AI providers ──────────────────────────────────────────────────────────────
+
+// Anthropic: a minimal authenticated read of the models list.
+export async function validateAnthropic(env: Env): Promise<ValidationResult> {
+  if (!env.ANTHROPIC_API_KEY) {
+    return { ok: false, detail: "Anthropic not configured — set the ANTHROPIC_API_KEY secret." };
+  }
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/models?limit=1", {
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      return { ok: true, detail: "Anthropic API key authenticated." };
+    }
+    if (response.status === 401) {
+      return { ok: false, detail: "Anthropic rejected the key (401) — check ANTHROPIC_API_KEY." };
+    }
+    return { ok: false, detail: `Anthropic check failed with HTTP ${response.status}.` };
+  } catch (err) {
+    return { ok: false, detail: `Anthropic request could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// OpenRouter: GET /key returns the key's own metadata — a cheap authenticated read.
+export async function validateOpenRouter(env: Env): Promise<ValidationResult> {
+  if (!env.OPENROUTER_API_KEY) {
+    return { ok: false, detail: "OpenRouter not configured — set the OPENROUTER_API_KEY secret." };
+  }
+
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/key", {
+      headers: {
+        authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      const body = (await response.json().catch(() => null)) as { data?: { label?: string } } | null;
+      const label = body?.data?.label;
+      return { ok: true, detail: `OpenRouter API key authenticated${label ? ` (${label})` : ""}.` };
+    }
+    if (response.status === 401) {
+      return { ok: false, detail: "OpenRouter rejected the key (401) — check OPENROUTER_API_KEY." };
+    }
+    return { ok: false, detail: `OpenRouter check failed with HTTP ${response.status}.` };
+  } catch (err) {
+    return { ok: false, detail: `OpenRouter request could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// OpenAI (also covers Codex, which authenticates with the same key): a
+// minimal authenticated read of the models list.
+export async function validateOpenAI(env: Env): Promise<ValidationResult> {
+  if (!env.OPENAI_API_KEY) {
+    return { ok: false, detail: "OpenAI not configured — set the OPENAI_API_KEY secret." };
+  }
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/models", {
+      headers: {
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        accept: "application/json",
+      },
+    });
+
+    if (response.status === 200) {
+      return { ok: true, detail: "OpenAI API key authenticated." };
+    }
+    if (response.status === 401) {
+      return { ok: false, detail: "OpenAI rejected the key (401) — check OPENAI_API_KEY." };
+    }
+    return { ok: false, detail: `OpenAI check failed with HTTP ${response.status}.` };
+  } catch (err) {
+    return { ok: false, detail: `OpenAI request could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// Aggregate AI result surfaced at /validate. All three providers are optional;
+// the aggregate is green only when at least one AI key is configured and EVERY
+// configured provider validates. A provider that isn't configured is neither
+// counted nor held against the agency.
+export async function validateAI(env: Env): Promise<ValidationResult> {
+  const providers: Array<{ name: string; configured: boolean; result: ValidationResult }> = [
+    { name: "Anthropic", configured: !!env.ANTHROPIC_API_KEY, result: await validateAnthropic(env) },
+    { name: "OpenRouter", configured: !!env.OPENROUTER_API_KEY, result: await validateOpenRouter(env) },
+    { name: "OpenAI", configured: !!env.OPENAI_API_KEY, result: await validateOpenAI(env) },
+  ];
+
+  const configured = providers.filter((provider) => provider.configured);
+  if (configured.length === 0) {
+    return {
+      ok: false,
+      detail: "No AI keys configured — set ANTHROPIC_API_KEY, OPENROUTER_API_KEY and/or OPENAI_API_KEY.",
+    };
+  }
+
+  const allOk = configured.every((provider) => provider.result.ok);
+  const detail = configured
+    .map((provider) => `${provider.name}: ${provider.result.ok ? "ok" : provider.result.detail}`)
+    .join(" | ");
+  return { ok: allOk, detail };
+}
+
+// ── Google Cloud ──────────────────────────────────────────────────────────────
+
+// Base64url-encode raw bytes (JWT segments are base64url with no padding).
+function base64UrlEncodeBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlEncodeString(value: string): string {
+  return base64UrlEncodeBytes(new TextEncoder().encode(value));
+}
+
+// Convert a PEM private key to its raw DER bytes for crypto.subtle.importKey.
+// Google service-account keys ship the private key as PKCS#8 PEM
+// ("-----BEGIN PRIVATE KEY-----"); JSON.parse already turned the JSON "\n"
+// escapes into real newlines, so stripping the armor + all whitespace and
+// base64-decoding yields the DER.
+function pemToDer(pem: string): Uint8Array {
+  const base64Body = pem
+    .replace(/-----BEGIN [^-]+-----/, "")
+    .replace(/-----END [^-]+-----/, "")
+    .replace(/\s+/g, "");
+  return Uint8Array.from(atob(base64Body), (char) => char.charCodeAt(0));
+}
+
+interface ServiceAccountKey {
+  client_email?: string;
+  private_key?: string;
+  project_id?: string;
+  token_uri?: string;
+}
+
+interface GoogleTokenResponse {
+  access_token?: string;
+}
+
+// Mint a Google OAuth2 access token via the JWT-bearer grant (RFC 7523 /
+// Google's "server-to-server" flow): build a JWT signed with the service
+// account's RS256 private key, POST it as the assertion, receive a bearer token.
+// This avoids any Google SDK — pure Web Crypto + fetch. Throws on failure.
+async function mintGoogleAccessToken(options: {
+  clientEmail: string;
+  privateKeyPem: string;
+  tokenUri: string;
+}): Promise<string> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const claims = {
+    iss: options.clientEmail,
+    // Least-privilege: read-only cloud-platform scope is enough for a
+    // projects.get authorization probe.
+    scope: "https://www.googleapis.com/auth/cloud-platform.read-only",
+    aud: options.tokenUri,
+    iat: nowSeconds,
+    exp: nowSeconds + 3600,
+  };
+
+  const signingInput =
+    `${base64UrlEncodeString(JSON.stringify(header))}.` +
+    `${base64UrlEncodeString(JSON.stringify(claims))}`;
+
+  // Import the PKCS#8 private key for RS256 (RSASSA-PKCS1-v1_5 + SHA-256) and
+  // sign the "<header>.<claims>" input. workerd and Node both support this.
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToDer(options.privateKeyPem),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signatureBytes = new Uint8Array(
+    await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput)),
+  );
+  const jwt = `${signingInput}.${base64UrlEncodeBytes(signatureBytes)}`;
+
+  const form = new URLSearchParams();
+  form.set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+  form.set("assertion", jwt);
+
+  const response = await fetch(options.tokenUri, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "application/json",
+    },
+    body: form.toString(),
+  });
+
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 300);
+    throw new Error(`Google token endpoint returned HTTP ${response.status}. ${body}`);
+  }
+  const data = (await response.json()) as GoogleTokenResponse;
+  if (!data.access_token) {
+    throw new Error("Google token endpoint response had no access_token.");
+  }
+  return data.access_token;
+}
+
+// Parse the SA-key JSON, mint an access token, then authorize a cheap
+// projects.get. ok when the token mints AND the project call authorizes.
+export async function validateGCP(env: Env): Promise<ValidationResult> {
+  if (!env.GCP_SERVICE_ACCOUNT_KEY) {
+    return {
+      ok: false,
+      detail: "Google Cloud not configured — set the GCP_SERVICE_ACCOUNT_KEY secret (the service-account JSON).",
+    };
+  }
+
+  let key: ServiceAccountKey;
+  try {
+    key = JSON.parse(env.GCP_SERVICE_ACCOUNT_KEY) as ServiceAccountKey;
+  } catch {
+    return {
+      ok: false,
+      detail: "Google Cloud service-account key is not valid JSON — paste the entire downloaded key file.",
+    };
+  }
+
+  const clientEmail = key.client_email;
+  const privateKeyPem = key.private_key;
+  const projectId = key.project_id;
+  const tokenUri = key.token_uri || "https://oauth2.googleapis.com/token";
+  if (!clientEmail || !privateKeyPem || !projectId) {
+    return {
+      ok: false,
+      detail:
+        "Google Cloud key JSON is missing client_email, private_key or project_id — use a service-account key, not an OAuth client ID.",
+    };
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await mintGoogleAccessToken({ clientEmail, privateKeyPem, tokenUri });
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `Google Cloud auth failed — could not mint an access token: ${errorMessage(err)}. Check the service-account key.`,
+    };
+  }
+
+  try {
+    const response = await fetch(
+      `https://cloudresourcemanager.googleapis.com/v1/projects/${encodeURIComponent(projectId)}`,
+      { headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" } },
+    );
+
+    if (response.status === 200) {
+      return {
+        ok: true,
+        detail: `Google Cloud authenticated as ${clientEmail}; project "${projectId}" is accessible.`,
+      };
+    }
+    if (response.status === 403) {
+      return {
+        ok: false,
+        detail: `Google Cloud token minted but project "${projectId}" access was denied (403) — grant the service account at least the Viewer role and enable the Cloud Resource Manager API.`,
+      };
+    }
+    if (response.status === 404) {
+      return {
+        ok: false,
+        detail: `Google Cloud project "${projectId}" not found (404) — check project_id in the key JSON.`,
+      };
+    }
+    const body = (await response.json().catch(() => null)) as { error?: { message?: string } } | null;
+    const message = body?.error?.message;
+    return {
+      ok: false,
+      detail: `Google Cloud project check failed with HTTP ${response.status}${message ? `: ${message}` : ""}.`,
+    };
+  } catch (err) {
+    return { ok: false, detail: `Google Cloud project check could not be sent: ${errorMessage(err)}.` };
+  }
+}
+
+// ── Aggregate ─────────────────────────────────────────────────────────────────
+
+// Run every validator in parallel. Independent network calls — no ordering
+// requirement — so Promise.all keeps /validate responsive.
+export async function validateAll(env: Env): Promise<AllValidations> {
+  const [gcp, s3, stripe, ai, r2Provision, cfDns] = await Promise.all([
+    validateGCP(env),
+    validateS3(env),
+    validateStripe(env),
+    validateAI(env),
+    validateR2Provision(env),
+    validateCfDns(env),
+  ]);
+  return { gcp, s3, stripe, ai, r2Provision, cfDns };
+}

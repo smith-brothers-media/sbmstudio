@@ -1,0 +1,40 @@
+# Local-only secrets for `wrangler dev`. Copy to `.dev.vars` (git-ignored) and
+# fill in real values. In production these are set with `wrangler secret put`,
+# NOT from this file. Do NOT commit `.dev.vars`.
+
+# Direction-A OAuth2 client credentials (issued by our app at onboarding)
+DY_CLIENT_ID=""
+DY_CLIENT_SECRET=""
+
+# Google Cloud service-account key — the ENTIRE downloaded JSON on one line
+GCP_SERVICE_ACCOUNT_KEY=""
+
+# S3 (or S3-compatible: set S3_ENDPOINT for R2/MinIO/Wasabi)
+S3_ACCESS_KEY_ID=""
+S3_SECRET_ACCESS_KEY=""
+S3_REGION="us-east-1"
+S3_BUCKET=""
+S3_ENDPOINT=""
+
+# Stripe (the agency's own account)
+STRIPE_SECRET_KEY=""
+
+# R2 provisioning — Cloudflare ACCOUNT-owned token (Manage Account -> Account
+# API Tokens, in the agency's own account) with Workers R2 Storage: Edit +
+# Account API Tokens: Edit. NOT a My Profile -> API Tokens (user) token.
+R2_PROVISION_API_TOKEN=""
+
+# Cloudflare DNS — API token with Zone:DNS:Edit + Zone:Read on the agency zone(s)
+# the platform may manage (Direction-B dns-record-upsert actuator).
+CF_DNS_API_TOKEN=""
+
+# Cell-agent access (Direction-B wp-cli actuator) — the base URL of the agency's OWN
+# on-VM cell-agent and its bearer token. The wp-cli op POSTs a shell-quoted `wp <args>`
+# to ${CELL_AGENT_URL}/exec with this bearer token. Single-cell in v1. Set BOTH together.
+CELL_AGENT_URL=""
+CELL_AGENT_TOKEN=""
+
+# AI providers — set at least one (OPENAI_API_KEY also covers Codex)
+ANTHROPIC_API_KEY=""
+OPENROUTER_API_KEY=""
+OPENAI_API_KEY=""
